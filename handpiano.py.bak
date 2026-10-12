@@ -1,0 +1,174 @@
+"""
+El Piyanosu - kameradan açık parmak sayısına göre nota çalar.
+
+1 parmak = Do, 2 = Re, 3 = Mi, 4 = Fa, 5 = Sol, yumruk = sus
+Çıkmak için pencere açıkken 'q' tuşuna bas.
+
+Kurulum:
+    python3 -m venv venv
+    source venv/bin/activate
+    pip install opencv-python mediapipe pygame numpy
+"""
+import os
+import time
+import urllib.request
+
+import cv2
+import numpy as np
+import pygame
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+
+# ---------------- Ayarlar ----------------
+MODEL_PATH = "hand_landmarker.task"
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/"
+             "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task")
+
+SAMPLE_RATE = 44100
+NOTES = {               # parmak sayısı -> (isim, frekans Hz)
+    1: ("Do", 261.63),
+    2: ("Re", 293.66),
+    3: ("Mi", 329.63),
+    4: ("Fa", 349.23),
+    5: ("Sol", 392.00),
+}
+STABLE_FRAMES = 4       # nota çalmadan önce durumun kaç kare sabit kalması gerektiği
+
+# MediaPipe el noktaları arasındaki bağlantılar (çizim için)
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),            # başparmak
+    (0, 5), (5, 6), (6, 7), (7, 8),            # işaret
+    (5, 9), (9, 10), (10, 11), (11, 12),       # orta
+    (9, 13), (13, 14), (14, 15), (15, 16),     # yüzük
+    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),  # serçe + avuç
+]
+
+
+# ---------------- Yardımcılar ----------------
+def ensure_model():
+    """El takip modelini ilk çalıştırmada indirir."""
+    if not os.path.exists(MODEL_PATH):
+        print("El modeli indiriliyor (bir kereye mahsus)...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+
+
+def make_tone(freq, duration=0.8):
+    """Basit piyano benzeri ton üretir: birkaç harmonik + sönümlenen zarf."""
+    t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
+    wave = (np.sin(2 * np.pi * freq * t)
+            + 0.5 * np.sin(2 * np.pi * 2 * freq * t)
+            + 0.25 * np.sin(2 * np.pi * 3 * freq * t))
+
+    envelope = np.exp(-3 * t)                       # zamanla sönme
+    attack = int(0.01 * SAMPLE_RATE)
+    envelope[:attack] *= np.linspace(0, 1, attack)  # tık sesini önlemek için yumuşak giriş
+    wave *= envelope
+    wave = wave / np.max(np.abs(wave)) * 0.6
+
+    samples = (wave * 32767).astype(np.int16)
+    if pygame.mixer.get_init()[2] == 2:             # stereo ise iki kanala kopyala
+        samples = np.column_stack([samples, samples])
+    return pygame.sndarray.make_sound(np.ascontiguousarray(samples))
+
+
+def dist(a, b):
+    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
+
+
+def count_fingers(lm):
+    """Açık parmak sayısını döndürür (el dik tutulduğunda en iyi çalışır)."""
+    count = 0
+    # Diğer 4 parmak: uç, orta boğumdan yukarıdaysa açık
+    for tip, pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
+        if lm[tip].y < lm[pip].y:
+            count += 1
+    # Başparmak: ucu serçe kökünden, kendi boğumundan daha uzaktaysa açık
+    # (sağ/sol el fark etmeksizin çalışır)
+    if dist(lm[4], lm[17]) > dist(lm[3], lm[17]):
+        count += 1
+    return count
+
+
+def draw_hand(frame, lm):
+    h, w = frame.shape[:2]
+    pts = [(int(p.x * w), int(p.y * h)) for p in lm]
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(frame, pts[a], pts[b], (255, 255, 255), 2)
+    for x, y in pts:
+        cv2.circle(frame, (x, y), 4, (0, 0, 255), -1)
+
+
+# ---------------- Ana döngü ----------------
+def main():
+    ensure_model()
+
+    pygame.mixer.init(frequency=SAMPLE_RATE, size=-16, channels=2, buffer=512)
+    sounds = {n: make_tone(f) for n, (_, f) in NOTES.items()}
+
+    options = vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.6,
+        min_tracking_confidence=0.5,
+    )
+    landmarker = vision.HandLandmarker.create_from_options(options)
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Kamera açılamadı. Sistem Ayarları > Gizlilik > Kamera'dan "
+              "VS Code / Terminal'e izin verdiğinden emin ol.")
+        return
+
+    last_played = 0
+    candidate, candidate_frames = 0, 0
+    start, last_ts = time.time(), -1
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame = cv2.flip(frame, 1)  # ayna görüntüsü, daha doğal hissettirir
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        ts = max(int((time.time() - start) * 1000), last_ts + 1)  # artan zaman damgası şart
+        last_ts = ts
+        result = landmarker.detect_for_video(mp_image, ts)
+
+        fingers = 0
+        if result.hand_landmarks:
+            lm = result.hand_landmarks[0]
+            fingers = count_fingers(lm)
+            draw_hand(frame, lm)
+
+        # Titremeyi önle: aynı sayı birkaç kare sürerse kabul et
+        if fingers == candidate:
+            candidate_frames += 1
+        else:
+            candidate, candidate_frames = fingers, 1
+
+        # Sadece durum DEĞİŞTİĞİNDE nota çal
+        if candidate_frames == STABLE_FRAMES and candidate != last_played:
+            pygame.mixer.stop()
+            if candidate in sounds:
+                sounds[candidate].play()
+            last_played = candidate
+
+        label = NOTES[last_played][0] if last_played in NOTES else "-"
+        cv2.putText(frame, f"Parmak: {fingers}   Nota: {label}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.imshow("El Piyanosu", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    landmarker.close()
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
